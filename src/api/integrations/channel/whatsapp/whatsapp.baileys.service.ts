@@ -92,6 +92,7 @@ import { useMultiFileAuthStateRedisDb } from '@utils/use-multi-file-auth-state-r
 import axios from 'axios';
 import makeWASocket, {
   AnyMessageContent,
+  Browsers,
   BufferedEventData,
   BufferJSON,
   CacheStore,
@@ -161,6 +162,8 @@ export interface ExtendedIMessageKey extends proto.IMessageKey {
   server_id?: string;
   isViewOnce?: boolean;
 }
+
+type HistorySyncType = proto.Message.HistorySyncType | proto.HistorySync.HistorySyncType;
 
 const groupMetadataCache = new CacheService(new CacheEngine(configService, 'groups').getEngine());
 
@@ -251,10 +254,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private historyMessageKeys: Set<string> | null = null;
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
+  private readonly HISTORY_SYNC_BATCH_SIZE = 500;
 
   public stateConnection: wa.StateConnection = { state: 'close' };
 
@@ -575,16 +580,25 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private async createClient(number?: string): Promise<WASocket> {
     this.instance.authState = await this.defineAuthState();
+    this.historyMessageKeys = null;
 
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
+    const syncFullHistory = this.localSettings.syncFullHistory === true;
 
     let browserOptions = {};
+
+    if (syncFullHistory) {
+      const browser = Browsers.macOS('Desktop');
+      browserOptions = { browser };
+
+      this.logger.info(`Browser: ${browser}`);
+    }
 
     if (number || this.phoneNumber) {
       this.phoneNumber = number;
 
       this.logger.info(`Phone number: ${number}`);
-    } else {
+    } else if (!syncFullHistory) {
       const browser: WABrowserDescription = [session.CLIENT, session.NAME, release()];
       browserOptions = { browser };
 
@@ -667,7 +681,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         return isGroupJid || isBroadcast || isNewsletter;
       },
-      syncFullHistory: this.localSettings.syncFullHistory,
+      syncFullHistory,
       shouldSyncHistoryMessage: (msg: proto.Message.IHistorySyncNotification) => {
         return this.historySyncNotification(msg);
       },
@@ -722,10 +736,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
     try {
-      this.loadChatwoot();
-      this.loadSettings();
-      this.loadWebhook();
-      this.loadProxy();
+      await Promise.all([this.loadChatwoot(), this.loadSettings(), this.loadWebhook(), this.loadProxy()]);
 
       // Remontar o messageProcessor para garantir que está funcionando após reconexão
       this.messageProcessor.mount({
@@ -816,10 +827,10 @@ export class BaileysStartupService extends ChannelStartupService {
         }));
 
         if (contactsRaw.length > 0) {
-          this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
-
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
             await this.prismaRepository.contact.createMany({ data: contactsRaw, skipDuplicates: true });
+
+          this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
 
           const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
           if (usersContacts) {
@@ -858,7 +869,6 @@ export class BaileysStartupService extends ChannelStartupService {
             await saveOnWhatsappCache(usersContacts.map((c) => ({ remoteJid: c.remoteJid })));
           }
 
-          this.sendDataWebhook(Events.CONTACTS_UPDATE, updatedContacts);
           await Promise.all(
             updatedContacts.map(async (contact) => {
               if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
@@ -887,6 +897,7 @@ export class BaileysStartupService extends ChannelStartupService {
               }
             }),
           );
+          this.sendDataWebhook(Events.CONTACTS_UPDATE, updatedContacts);
         }
       } catch (error) {
         console.error(error);
@@ -936,34 +947,30 @@ export class BaileysStartupService extends ChannelStartupService {
       contacts: Contact[];
       messages: WAMessage[];
       isLatest?: boolean;
-      progress?: number;
-      syncType?: proto.HistorySync.HistorySyncType;
+      progress?: number | null;
+      syncType?: proto.HistorySync.HistorySyncType | null;
     }) => {
       try {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-          console.log('received on-demand history sync, messages=', messages);
+          this.logger.info(`Received on-demand history sync with ${messages.length} messages`);
         }
-        console.log(
+        this.logger.info(
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
         );
 
         const instance: InstanceDto = { instanceName: this.instance.name };
 
-        let timestampLimitToImport = null;
+        let timestampLimitToImport: number | null = null;
 
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
-          const daysLimitToImport = this.localChatwoot?.enabled ? this.localChatwoot.daysLimitImportMessages : 1000;
+        if (
+          this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
+          this.localChatwoot?.enabled &&
+          this.localChatwoot.importMessages
+        ) {
+          const daysLimitToImport = this.localChatwoot.daysLimitImportMessages ?? 60;
 
           const date = new Date();
           timestampLimitToImport = new Date(date.setDate(date.getDate() - daysLimitToImport)).getTime() / 1000;
-
-          const maxBatchTimestamp = Math.max(...messages.map((message) => message.messageTimestamp as number));
-
-          const processBatch = maxBatchTimestamp >= timestampLimitToImport;
-
-          if (!processBatch) {
-            return;
-          }
         }
 
         const contactsMap = new Map();
@@ -989,34 +996,30 @@ export class BaileysStartupService extends ChannelStartupService {
           chatsRaw.push({ remoteJid: chat.id, instanceId: this.instanceId, name: chat.name });
         }
 
-        this.sendDataWebhook(Events.CHATS_SET, chatsRaw);
-
-        if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
+        if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC && chatsRaw.length > 0) {
           await this.prismaRepository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
         }
 
-        const messagesRaw: any[] = [];
+        this.sendDataWebhook(Events.CHATS_SET, chatsRaw);
 
-        const messagesRepository: Set<string> = new Set(
-          chatwootImport.getRepositoryMessagesCache(instance) ??
+        const messagesRaw: any[] = [];
+        const newMessageKeys = new Set<string>();
+
+        if (this.historyMessageKeys === null) {
+          this.historyMessageKeys = new Set(
             (
               await this.prismaRepository.message.findMany({
                 select: { key: true },
                 where: { instanceId: this.instanceId },
               })
-            ).map((message) => {
-              const key = message.key as { id: string };
-
-              return key.id;
-            }),
-        );
-
-        if (chatwootImport.getRepositoryMessagesCache(instance) === null) {
-          chatwootImport.setRepositoryMessagesCache(instance, messagesRepository);
+            ).map((message) => this.getMessageDeduplicationKey(message.key as proto.IMessageKey)),
+          );
         }
 
+        const messagesRepository = this.historyMessageKeys;
+
         for (const m of messages) {
-          if (!m.message || !m.key || !m.messageTimestamp) {
+          if (!m.message || !m.key?.id || !m.key.remoteJid || !m.messageTimestamp) {
             continue;
           }
 
@@ -1024,13 +1027,9 @@ export class BaileysStartupService extends ChannelStartupService {
             m.messageTimestamp = m.messageTimestamp?.toNumber();
           }
 
-          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
-            if (m.messageTimestamp <= timestampLimitToImport) {
-              continue;
-            }
-          }
+          const messageKey = this.getMessageDeduplicationKey(m.key);
 
-          if (messagesRepository?.has(m.key.id)) {
+          if (messagesRepository.has(messageKey) || newMessageKeys.has(messageKey)) {
             continue;
           }
 
@@ -1044,16 +1043,30 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           messagesRaw.push(this.prepareMessage(m));
+          newMessageKeys.add(messageKey);
         }
+
+        if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC && messagesRaw.length > 0) {
+          const transactions = [];
+
+          for (let index = 0; index < messagesRaw.length; index += this.HISTORY_SYNC_BATCH_SIZE) {
+            transactions.push(
+              this.prismaRepository.message.createMany({
+                data: messagesRaw.slice(index, index + this.HISTORY_SYNC_BATCH_SIZE),
+                skipDuplicates: true,
+              }),
+            );
+          }
+
+          await this.prismaRepository.$transaction(transactions);
+        }
+
+        newMessageKeys.forEach((messageKey) => messagesRepository.add(messageKey));
 
         this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw], true, undefined, {
           isLatest,
           progress,
         });
-
-        if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
-        }
 
         if (
           this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
@@ -1063,7 +1076,11 @@ export class BaileysStartupService extends ChannelStartupService {
         ) {
           this.chatwootService.addHistoryMessages(
             instance,
-            messagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
+            messagesRaw.filter(
+              (msg) =>
+                (timestampLimitToImport === null || msg.messageTimestamp > timestampLimitToImport) &&
+                !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid),
+            ),
           );
         }
 
@@ -1071,11 +1088,23 @@ export class BaileysStartupService extends ChannelStartupService {
           contacts.filter((c) => !!c.notify || !!c.name).map((c) => ({ id: c.id, name: c.name ?? c.notify })),
         );
 
+        if (
+          progress === 100 &&
+          this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
+          this.localChatwoot?.enabled &&
+          this.localChatwoot.importMessages &&
+          this.isUsedHistorySyncType(syncType)
+        ) {
+          await this.chatwootService.importHistoryMessages(instance);
+        }
+
         contacts = undefined;
         messages = undefined;
         chats = undefined;
       } catch (error) {
-        this.logger.error(error);
+        this.logger.error(
+          `History sync processing failed (type: ${syncType}, progress: ${progress}%): ${error?.message ?? error}`,
+        );
       }
     },
 
@@ -2013,6 +2042,11 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private historySyncNotification(msg: proto.Message.IHistorySyncNotification) {
+    if (!this.shouldProcessHistorySyncType(msg.syncType)) {
+      this.logger.debug(`History sync type ignored: ${msg.syncType}`);
+      return false;
+    }
+
     const instance: InstanceDto = { instanceName: this.instance.name };
 
     if (
@@ -2024,22 +2058,40 @@ export class BaileysStartupService extends ChannelStartupService {
       if (msg.chunkOrder === 1) {
         this.chatwootService.startImportHistoryMessages(instance);
       }
-
-      if (msg.progress === 100) {
-        setTimeout(() => {
-          this.chatwootService.importHistoryMessages(instance);
-        }, 10000);
-      }
     }
 
     return true;
   }
 
   private isSyncNotificationFromUsedSyncType(msg: proto.Message.IHistorySyncNotification) {
+    return this.isUsedHistorySyncType(msg.syncType);
+  }
+
+  private isUsedHistorySyncType(syncType?: HistorySyncType | null) {
     return (
-      (this.localSettings.syncFullHistory && msg?.syncType === 2) ||
-      (!this.localSettings.syncFullHistory && msg?.syncType === 3)
+      (this.localSettings.syncFullHistory && syncType === proto.HistorySync.HistorySyncType.FULL) ||
+      (!this.localSettings.syncFullHistory && syncType === proto.HistorySync.HistorySyncType.RECENT)
     );
+  }
+
+  private shouldProcessHistorySyncType(syncType?: HistorySyncType | null) {
+    switch (syncType) {
+      case proto.HistorySync.HistorySyncType.FULL:
+        return this.localSettings.syncFullHistory === true;
+      case proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP:
+      case proto.HistorySync.HistorySyncType.INITIAL_STATUS_V3:
+      case proto.HistorySync.HistorySyncType.RECENT:
+      case proto.HistorySync.HistorySyncType.PUSH_NAME:
+      case proto.HistorySync.HistorySyncType.NON_BLOCKING_DATA:
+      case proto.HistorySync.HistorySyncType.ON_DEMAND:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  private getMessageDeduplicationKey(key: proto.IMessageKey) {
+    return JSON.stringify([key.remoteJid, key.id, key.fromMe]);
   }
 
   public async profilePicture(number: string) {
