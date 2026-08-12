@@ -1,0 +1,29 @@
+name: Deploy to Coolify
+
+# Manual only. A push to main builds and publishes the image, it never deploys.
+# Run this workflow when you decide to send a build to production.
+#
+# Required repository secrets:
+#   COOLIFY_WEBHOOK_URL - the Deploy Webhook URL of the resource, copied from Coolify
+#   COOLIFY_API_TOKEN   - a Coolify API token with deploy permission
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Trigger the Coolify deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the Coolify deploy webhook
+        env:
+          COOLIFY_WEBHOOK_URL: ${{ secrets.COOLIFY_WEBHOOK_URL }}
+          COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+        run: |
+          if [ -z "$COOLIFY_WEBHOOK_URL" ] || [ -z "$COOLIFY_API_TOKEN" ]; then
+            echo "Set the COOLIFY_WEBHOOK_URL and COOLIFY_API_TOKEN secrets first."
+            exit 1
+          fi
+
+          curl --silent --show-error --fail-with-body \
+            --header "Authorization: Bearer ${COOLIFY_API_TOKEN}" \
+            "${COOLIFY_WEBHOOK_URL}"
