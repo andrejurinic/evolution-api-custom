@@ -9,6 +9,11 @@ jobs:
   build_deploy:
     name: Build and Deploy
     runs-on: ubuntu-latest
+    # Workflow do upstream: publica em evoapicloud/evolution-api com credenciais
+    # do Docker Hub que este fork não tem. Sem a guarda, a tag v* deste repo
+    # (que casa com o filtro *.*.*) dispararia um build fadado a falhar. O fork
+    # publica em ghcr.io via publish_docker_image_latest.yml e release.yml.
+    if: github.repository == 'EvolutionAPI/evolution-api'
     permissions:
       contents: read
       packages: write
