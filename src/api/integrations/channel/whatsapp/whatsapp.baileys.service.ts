@@ -255,6 +255,18 @@ export class BaileysStartupService extends ChannelStartupService {
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
 
+  // Controle de reconexão. Cada 'connection.update: close' abria um socket novo
+  // na hora, enquanto o socket anterior continuava emitindo eventos: o WhatsApp
+  // derrubava as sessões concorrentes e a instância entrava em loop de
+  // close/open. Envios em voo ficavam pendurados até o cliente HTTP desistir.
+  private socketGeneration = 0;
+  private socketEventsOff: (() => void) | null = null;
+  private connectingPromise: Promise<WASocket> | null = null;
+  private reconnectingPromise: Promise<void> | null = null;
+  private reconnectAttempts = 0;
+  private readonly RECONNECT_BASE_DELAY_MS = 2_000;
+  private readonly RECONNECT_MAX_DELAY_MS = 60_000;
+
   // Deduplication caches for history sync, rebuilt on every new socket
   private historyMessageKeys: Set<string> | null = null;
   private historyChatJids: Set<string> | null = null;
@@ -439,7 +451,7 @@ export class BaileysStartupService extends ChannelStartupService {
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
       if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
+        await this.scheduleReconnect();
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
@@ -476,6 +488,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      this.reconnectAttempts = 0;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -682,6 +695,10 @@ export class BaileysStartupService extends ChannelStartupService {
       fireInitQueries: true,
       connectTimeoutMs: 30_000,
       keepAliveIntervalMs: 30_000,
+      // Sem isso o Baileys usa 60s por query (onWhatsApp, lista de devices do
+      // destinatário, etc.). Num socket morrendo, o envio ficava pendurado além
+      // do timeout de qualquer cliente HTTP em vez de falhar com erro claro.
+      defaultQueryTimeoutMs: 15_000,
       qrTimeout: 45_000,
       emitOwnEvents: false,
       shouldIgnoreJid: (jid) => {
@@ -723,6 +740,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
 
+    // Nova geração antes de derrubar o socket antigo: os handlers dele param de
+    // agir sobre a instância (inclusive de pedir reconexão) a partir daqui.
+    this.socketGeneration += 1;
+    this.destroyCurrentSocket();
+
     this.client = makeWASocket(socketConfig);
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
@@ -749,6 +771,24 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    // Single-flight: /instance/connect (chamado em loop pelo frontend enquanto a
+    // instância está fora do ar) e a reconexão automática disparavam isso em
+    // paralelo, e cada chamada abria mais um socket para a mesma sessão.
+    if (this.connectingPromise) {
+      this.logger.info(`Connection already in progress for ${this.instance.name}, reusing it`);
+      return this.connectingPromise;
+    }
+
+    this.connectingPromise = this.startConnection(number);
+
+    try {
+      return await this.connectingPromise;
+    } finally {
+      this.connectingPromise = null;
+    }
+  }
+
+  private async startConnection(number?: string): Promise<WASocket> {
     try {
       // These populate localSettings/localChatwoot/localProxy, which createClient reads
       // to build the socket. Without awaiting, syncFullHistory would still be undefined
@@ -764,6 +804,73 @@ export class BaileysStartupService extends ChannelStartupService {
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
+    }
+  }
+
+  /**
+   * Reconecta uma vez por vez e com backoff exponencial. Reconectar na hora (e
+   * em paralelo) fazia o WhatsApp derrubar as sessões concorrentes, mantendo a
+   * instância em close/open a cada poucos segundos.
+   */
+  private async scheduleReconnect(): Promise<void> {
+    if (this.reconnectingPromise) {
+      this.logger.warn(`Reconnect already scheduled for ${this.instance.name}, skipping`);
+      return this.reconnectingPromise;
+    }
+
+    const attempt = ++this.reconnectAttempts;
+    const backoff = Math.min(this.RECONNECT_BASE_DELAY_MS * 2 ** (attempt - 1), this.RECONNECT_MAX_DELAY_MS);
+    const waitMs = backoff + Math.floor(Math.random() * 1000);
+
+    this.logger.info(`Reconnecting ${this.instance.name} in ${waitMs}ms (attempt ${attempt})`);
+
+    this.reconnectingPromise = (async () => {
+      await delay(waitMs);
+
+      if (this.endSession) return;
+
+      // Alguém já reconectou nesse meio tempo (outro close, ou o
+      // /instance/connect do frontend): abrir mais um socket só derrubaria esse.
+      if (this.connectionStatus.state !== 'close') {
+        if (this.connectionStatus.state === 'open') this.reconnectAttempts = 0;
+        return;
+      }
+
+      await this.connectToWhatsapp(this.phoneNumber);
+    })();
+
+    try {
+      await this.reconnectingPromise;
+    } catch (error) {
+      this.logger.error(['Reconnect failed', error?.message ?? error]);
+    } finally {
+      this.reconnectingPromise = null;
+    }
+  }
+
+  /** Fecha o socket atual e para de escutar os eventos dele. */
+  private destroyCurrentSocket(): void {
+    try {
+      this.socketEventsOff?.();
+    } catch (error) {
+      this.logger.error(['Failed to detach socket listeners', error?.message ?? error]);
+    }
+    this.socketEventsOff = null;
+
+    const previous = this.client;
+
+    if (!previous) return;
+
+    try {
+      previous.ws?.close();
+    } catch (error) {
+      this.logger.error(['Failed to close previous socket', error?.message ?? error]);
+    }
+
+    try {
+      previous.end(new Error('Socket replaced by a new connection'));
+    } catch (error) {
+      this.logger.error(['Failed to end previous socket', error?.message ?? error]);
     }
   }
 
@@ -1946,7 +2053,13 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
-    this.client.ev.process(async (events) => {
+    const generation = this.socketGeneration;
+
+    const unsubscribe = this.client.ev.process(async (events) => {
+      // Evento de socket já substituído não mexe mais no estado da instância:
+      // era isso que fazia o socket velho pedir reconexão e multiplicar sessões.
+      if (generation !== this.socketGeneration) return;
+
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
           if (!this.endSession) {
@@ -2083,6 +2196,8 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       });
     });
+
+    this.socketEventsOff = unsubscribe;
   }
 
   private historySyncNotification(msg: proto.Message.IHistorySyncNotification) {
@@ -2426,6 +2541,15 @@ export class BaileysStartupService extends ChannelStartupService {
     options?: Options,
     isIntegration = false,
   ) {
+    // Com o socket fora do ar o envio não falha na hora: a query fica pendurada
+    // até o timeout do Baileys e quem chamou a API desiste antes, sem saber o
+    // motivo. Melhor recusar de imediato dizendo o estado da conexão.
+    if (this.connectionStatus.state !== 'open') {
+      throw new BadRequestException(
+        `The "${this.instance.name}" instance is not connected (state: ${this.connectionStatus.state})`,
+      );
+    }
+
     const isWA = (await this.whatsappNumber({ numbers: [number] }))?.shift();
 
     if (!isWA.exists && !isJidGroup(isWA.jid) && !isWA.jid.includes('@broadcast')) {
